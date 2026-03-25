@@ -17,7 +17,7 @@ from typing import List, Optional
 import config as cfg
 
 CLAUDE_DAILY_LIMIT = 20   # calls per device per day — edit here to change
-DB_PATH            = cfg.DB_PATH
+DB_PATH            = "sentinel.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS predictions (
