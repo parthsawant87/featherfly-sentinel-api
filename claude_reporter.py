@@ -6,7 +6,9 @@
 import anthropic, os
 from rca_engine import RCAResult
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+def get_client():
+    import anthropic, os
+    return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MODEL  = "claude-haiku-4-5-20251001"
 
 SYSTEM_PROMPT = """You are SENTINEL, an expert semiconductor process engineer AI assistant.
@@ -35,7 +37,7 @@ Fab Impact: {rca.fab_impact}
 Process Checks: {', '.join(rca.process_check[:2])}
 
 Write a 3-sentence report: (1) what was detected and severity, (2) most likely root cause, (3) recommended immediate action."""
-
+    client = get_client()
     resp = client.messages.create(
         model=MODEL, max_tokens=220,
         system=SYSTEM_PROMPT,
@@ -51,6 +53,7 @@ def answer_engineer_question(question: str, context: dict, history: list=None) -
         "role": "user",
         "content": f"Inspection context: {context}\n\nQuestion: {question}"
     }]
+    client = get_client()
     resp = client.messages.create(
         model=MODEL, max_tokens=300,
         system=SYSTEM_PROMPT, messages=msgs
@@ -67,7 +70,7 @@ Wafer yield: {wafer_map_data['yield_pct']:.1f}%
 Defect distribution: {wafer_map_data['summary']}
 
 Write a 4-sentence executive summary: (1) overall yield and pass/fail, (2) dominant defect type and severity, (3) most likely process root cause, (4) recommended immediate action for the process team."""
-
+    client = get_client()
     resp = client.messages.create(
         model=MODEL, max_tokens=280,
         system=SYSTEM_PROMPT,
