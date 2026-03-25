@@ -3,6 +3,6 @@ uvicorn[standard]>=0.22.0
 python-multipart>=0.0.6
 pillow==11.1.0
 numpy==1.26.4
-anthropic==0.20.0
+anthropic==0.28.0
 python-dotenv==1.0.0
 gunicorn==21.2.0
