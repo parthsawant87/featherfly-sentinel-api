@@ -33,26 +33,32 @@ app.add_middleware(
 )
 
 # ── Load TFLite model at startup ──────────────────────────────────────────
+# ── Load TFLite model at startup (SAFE + ROBUST) ──────────────────────────
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 _TFLITE_PATH = BASE_DIR / "models" / "sentinel_int8.tflite"
+
+print("MODEL PATH:", _TFLITE_PATH)
+print("FILE EXISTS:", _TFLITE_PATH.exists())
 
 try:
     import tflite_runtime.interpreter as tflite_lib
 except ImportError:
     import tensorflow.lite as tflite_lib
 
-print("MODEL PATH:", _TFLITE_PATH)
-print("FILE EXISTS:", os.path.exists(_TFLITE_PATH))
+try:
+    _interp = tflite_lib.Interpreter(model_path=str(_TFLITE_PATH))  # ✅ FIXED
+    _interp.allocate_tensors()
+    _IN  = _interp.get_input_details()[0]
+    _OUT = _interp.get_output_details()[0]
+    print("✅ TFLite model loaded successfully")
 
-_interp = tflite_lib.Interpreter(model_path=str(_TFLITE_PATH))
-_interp.allocate_tensors()
-_IN  = _interp.get_input_details()[0]
-_OUT = _interp.get_output_details()[0]
-
-_latest_result: dict = {}
-_sse_subscribers: list = []          # list of asyncio.Queue for connected SSE clients
+except Exception as e:
+    print("❌ MODEL LOAD FAILED:", str(e))
+    _interp = None
+    _IN = None
+    _OUT = None          # list of asyncio.Queue for connected SSE clients
 
 
 # ── SSE: notify all connected dashboard clients ───────────────────────────
@@ -78,13 +84,21 @@ def preprocess(img: Image.Image) -> np.ndarray:
     return (arr / in_sc + in_zp).astype(np.int8)
 
 def run_inference(img: Image.Image) -> tuple:
+    if _interp is None:
+        raise RuntimeError("Model not loaded")
+
     _interp.set_tensor(_IN["index"], preprocess(img))
     _interp.invoke()
+
     out_sc, out_zp = _OUT["quantization"]
     q      = _interp.get_tensor(_OUT["index"])[0]
     logits = (q.astype(np.float32) - out_zp) * out_sc
-    probs  = np.exp(logits) / np.exp(logits).sum()
-    pi     = int(probs.argmax())
+
+    # ✅ STABLE SOFTMAX (IMPORTANT)
+    e = np.exp(logits - np.max(logits))
+    probs = e / e.sum()
+
+    pi = int(probs.argmax())
     return cfg.CLASS_NAMES[pi], float(probs[pi]), probs
 
 
@@ -92,6 +106,10 @@ def run_inference(img: Image.Image) -> tuple:
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     global _latest_result
+
+    if _interp is None:
+        raise HTTPException(500, "Model not loaded properly")
+
     try:
         data             = await file.read()
         img              = Image.open(io.BytesIO(data)).convert("RGB")
