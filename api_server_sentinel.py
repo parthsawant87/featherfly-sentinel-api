@@ -43,6 +43,9 @@ try:
 except ImportError:
     import tensorflow.lite as tflite_lib
 
+print("MODEL PATH:", _TFLITE_PATH)
+print("FILE EXISTS:", os.path.exists(_TFLITE_PATH))
+
 _interp = tflite_lib.Interpreter(model_path=_TFLITE_PATH)
 _interp.allocate_tensors()
 _IN  = _interp.get_input_details()[0]
