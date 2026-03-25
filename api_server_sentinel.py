@@ -33,7 +33,11 @@ app.add_middleware(
 )
 
 # ── Load TFLite model at startup ──────────────────────────────────────────
-_TFLITE_PATH = os.path.join(cfg.EXPORT_DIR, cfg.TFLITE_MODEL_NAME)
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+_TFLITE_PATH = BASE_DIR / "models" / "sentinel_int8.tflite"
+
 try:
     import tflite_runtime.interpreter as tflite_lib
 except ImportError:
