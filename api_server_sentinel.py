@@ -201,3 +201,14 @@ def health():
         "claude_budget": get_claude_usage_today(),
         "sse_clients":   len(_sse_subscribers),
     }
+
+#----fix error-------------------------------------------------
+import os
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "api_server_sentinel:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
