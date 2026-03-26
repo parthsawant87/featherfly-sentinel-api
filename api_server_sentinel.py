@@ -105,22 +105,31 @@ def preprocess(img: Image.Image) -> np.ndarray:
 # ─────────────────────────────────────────────
 # INFERENCE (FIXED)
 # ─────────────────────────────────────────────
-def run_inference(img: Image.Image):
-    interp, IN, OUT = get_interpreter()
+def get_interpreter():
+    global _interp, _IN, _OUT
 
-    interp.set_tensor(IN["index"], preprocess(img))
-    interp.invoke()
+    print("STEP 1: enter get_interpreter")
 
-    out_sc, out_zp = OUT["quantization"]
-    q = interp.get_tensor(OUT["index"])[0]
-    logits = (q.astype(np.float32) - out_zp) * out_sc
+    if _interp is None:
+        print("STEP 2: creating interpreter")
 
-    # stable softmax
-    e = np.exp(logits - np.max(logits))
-    probs = e / e.sum()
+        _interp = tflite_lib.Interpreter(
+            model_path=str(_TFLITE_PATH),
+            num_threads=1
+        )
 
-    pi = int(probs.argmax())
-    return cfg.CLASS_NAMES[pi], float(probs[pi]), probs
+        print("STEP 3: interpreter created")
+
+        _interp.allocate_tensors()
+
+        print("STEP 4: tensors allocated")
+
+        _IN = _interp.get_input_details()[0]
+        _OUT = _interp.get_output_details()[0]
+
+        print("STEP 5: model ready")
+
+    return _interp, _IN, _OUT
 
 
 # ─────────────────────────────────────────────
