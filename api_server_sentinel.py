@@ -1,69 +1,82 @@
-# api_server_sentinel.py — SENTINEL FastAPI Production Server
-# Endpoints:
-#   POST /predict       — classify single uploaded image
-#   POST /wafer-map     — process batch of grid images
-#   POST /chat          — Claude Q&A about inspection results
-#   GET  /stream        — Server-Sent Events live push (~50ms latency)
-#   GET  /latest        — most recent classification (SSE fallback)
-#   GET  /spc           — SPC EWMA drift status
-#   GET  /health        — liveness check
-#
-# Run on RPi:    gunicorn api_server_sentinel:app --workers 1 --bind 0.0.0.0:8000
-# Run locally:   uvicorn api_server_sentinel:app --reload --port 8000
-# Run on Render: gunicorn api_server_sentinel:app --workers 1 --bind 0.0.0.0:$PORT
+# api_server_sentinel.py — FIXED VERSION
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse   # ← StreamingResponse added
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-import numpy as np, io, time, os, asyncio, json                # ← asyncio, json added
+import numpy as np, io, time, os, asyncio, json
 from PIL import Image
+from pathlib import Path
+
 import config as cfg
 from rca_engine import analyze
 from claude_reporter import generate_inspection_report, answer_engineer_question
-from db_logger import log_prediction, can_call_claude, record_claude_call
+from db_logger import log_prediction, can_call_claude, record_claude_call, get_claude_usage_today
 from active_learner import flag_if_uncertain
 from spc_monitor import check_spc
 
+# ─────────────────────────────────────────────
+# APP INIT
+# ─────────────────────────────────────────────
 app = FastAPI(title="Featherfly SENTINEL API", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Load TFLite model at startup ──────────────────────────────────────────
-# ── Load TFLite model at startup (SAFE + ROBUST) ──────────────────────────
-from pathlib import Path
+# ─────────────────────────────────────────────
+# GLOBALS (FIXED)
+# ─────────────────────────────────────────────
+_sse_subscribers = []
+_latest_result = None
 
+_interp = None
+_IN = None
+_OUT = None
+
+# ─────────────────────────────────────────────
+# MODEL PATH
+# ─────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 _TFLITE_PATH = BASE_DIR / "models" / "sentinel_int8.tflite"
 
 print("MODEL PATH:", _TFLITE_PATH)
 print("FILE EXISTS:", _TFLITE_PATH.exists())
 
+# ─────────────────────────────────────────────
+# LOAD TFLITE LIB
+# ─────────────────────────────────────────────
 try:
     import tflite_runtime.interpreter as tflite_lib
 except ImportError:
     import tensorflow.lite as tflite_lib
 
-try:
-    _interp = tflite_lib.Interpreter(model_path=str(_TFLITE_PATH))  # ✅ FIXED
-    _interp.allocate_tensors()
-    _IN  = _interp.get_input_details()[0]
-    _OUT = _interp.get_output_details()[0]
-    print("✅ TFLite model loaded successfully")
+# ─────────────────────────────────────────────
+# LAZY MODEL LOADING (FIXED)
+# ─────────────────────────────────────────────
+def get_interpreter():
+    global _interp, _IN, _OUT
 
-except Exception as e:
-    print("❌ MODEL LOAD FAILED:", str(e))
-    _interp = None
-    _IN = None
-    _OUT = None          # list of asyncio.Queue for connected SSE clients
+    if _interp is None:
+        print("[model] Loading TFLite model...")
+
+        _interp = tflite_lib.Interpreter(model_path=str(_TFLITE_PATH))
+        _interp.allocate_tensors()
+
+        _IN = _interp.get_input_details()[0]
+        _OUT = _interp.get_output_details()[0]
+
+        print("[model] ✓ Model loaded successfully")
+
+    return _interp, _IN, _OUT
 
 
-# ── SSE: notify all connected dashboard clients ───────────────────────────
+# ─────────────────────────────────────────────
+# SSE
+# ─────────────────────────────────────────────
 async def _notify_sse(result: dict):
-    """Push result to every connected EventSource client immediately."""
     dead = []
     for q in _sse_subscribers:
         try:
@@ -74,27 +87,35 @@ async def _notify_sse(result: dict):
         _sse_subscribers.remove(q)
 
 
-# ── Inference helpers ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# PREPROCESS (FIXED)
+# ─────────────────────────────────────────────
 def preprocess(img: Image.Image) -> np.ndarray:
+    _, IN, _ = get_interpreter()
+
     arr = np.array(img.resize((cfg.IMG_SIZE, cfg.IMG_SIZE)), dtype=np.float32)
     arr = (arr / 255.0 - np.array(cfg.IMG_MEAN)) / np.array(cfg.IMG_STD)
-    arr = np.transpose(arr, (2, 0, 1))        # HWC → CHW
-    arr = arr[np.newaxis]                      # [1, 3, H, W]
-    in_sc, in_zp = _IN["quantization"]
+    arr = np.transpose(arr, (2, 0, 1))
+    arr = arr[np.newaxis]
+
+    in_sc, in_zp = IN["quantization"]
     return (arr / in_sc + in_zp).astype(np.int8)
 
-def run_inference(img: Image.Image) -> tuple:
-    if _interp is None:
-        raise RuntimeError("Model not loaded")
 
-    _interp.set_tensor(_IN["index"], preprocess(img))
-    _interp.invoke()
+# ─────────────────────────────────────────────
+# INFERENCE (FIXED)
+# ─────────────────────────────────────────────
+def run_inference(img: Image.Image):
+    interp, IN, OUT = get_interpreter()
 
-    out_sc, out_zp = _OUT["quantization"]
-    q      = _interp.get_tensor(_OUT["index"])[0]
+    interp.set_tensor(IN["index"], preprocess(img))
+    interp.invoke()
+
+    out_sc, out_zp = OUT["quantization"]
+    q = interp.get_tensor(OUT["index"])[0]
     logits = (q.astype(np.float32) - out_zp) * out_sc
 
-    # ✅ STABLE SOFTMAX (IMPORTANT)
+    # stable softmax
     e = np.exp(logits - np.max(logits))
     probs = e / e.sum()
 
@@ -102,21 +123,20 @@ def run_inference(img: Image.Image) -> tuple:
     return cfg.CLASS_NAMES[pi], float(probs[pi]), probs
 
 
-# ── Routes ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     global _latest_result
 
-    if _interp is None:
-        raise HTTPException(500, "Model not loaded properly")
-
     try:
-        data             = await file.read()
-        img              = Image.open(io.BytesIO(data)).convert("RGB")
-        cls, conf, probs = run_inference(img)
-        rca              = analyze(cls, conf)
+        data = await file.read()
+        img = Image.open(io.BytesIO(data)).convert("RGB")
 
-        # Claude report — only if daily budget not exhausted
+        cls, conf, probs = run_inference(img)
+        rca = analyze(cls, conf)
+
         if can_call_claude():
             report = generate_inspection_report(rca)
             record_claude_call()
@@ -125,54 +145,55 @@ async def predict(file: UploadFile = File(...)):
 
         result = {
             "predicted_class": cls,
-            "confidence":      round(conf, 4),
-            "severity":        rca.severity,
-            "root_cause":      rca.primary_cause,
-            "action":          rca.action,
-            "report":          report,
-            "low_confidence":  rca.low_confidence,
-            "probabilities":   {cfg.CLASS_NAMES[i]: round(float(p), 4)
-                                 for i, p in enumerate(probs)},
-            "timestamp":       time.time(),
-            "filename":        file.filename,
+            "confidence": round(conf, 4),
+            "severity": rca.severity,
+            "root_cause": rca.primary_cause,
+            "action": rca.action,
+            "report": report,
+            "low_confidence": rca.low_confidence,
+            "probabilities": {
+                cfg.CLASS_NAMES[i]: round(float(p), 4)
+                for i, p in enumerate(probs)
+            },
+            "timestamp": time.time(),
+            "filename": file.filename,
         }
-        _latest_result = result
-        log_prediction(result, module="sentinel")
-        flag_if_uncertain(result)              # queue low-confidence for review
 
-        # Push to all SSE subscribers — instant dashboard update
+        _latest_result = result
+
+        log_prediction(result, module="sentinel")
+        flag_if_uncertain(result)
+
         await _notify_sse(result)
 
         return JSONResponse(result)
+
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
+# ─────────────────────────────────────────────
+# SSE STREAM
+# ─────────────────────────────────────────────
 @app.get("/stream")
 async def sse_stream():
-    """Server-Sent Events endpoint.
-    Dashboard connects once via EventSource('/stream').
-    Result is pushed the instant /predict completes — ~50ms vs 3s polling.
-    Heartbeat comment sent every 15s to keep connection alive through proxies.
-    """
     queue = asyncio.Queue()
     _sse_subscribers.append(queue)
 
     async def event_generator():
-        # Send heartbeat immediately so client knows connection is alive
         yield ": heartbeat\n\n"
-        # Send last known result if available
+
         if _latest_result:
             yield f"data: {json.dumps(_latest_result)}\n\n"
+
         try:
             while True:
                 try:
                     result = await asyncio.wait_for(queue.get(), timeout=15.0)
                     yield f"data: {json.dumps(result)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"    # keepalive — not a data event
+                    yield ": heartbeat\n\n"
         except asyncio.CancelledError:
-            # Client disconnected — clean up
             if queue in _sse_subscribers:
                 _sse_subscribers.remove(queue)
             raise
@@ -181,57 +202,61 @@ async def sse_stream():
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering":"no",           # disables Nginx/Render proxy buffering
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
         }
     )
 
 
+# ─────────────────────────────────────────────
+# CHAT
+# ─────────────────────────────────────────────
 class ChatRequest(BaseModel):
     question: str
-    context:  dict = {}
-    history:  list = []
+    context: dict = {}
+    history: list = []
+
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    ctx    = req.context or _latest_result
+    ctx = req.context or _latest_result
     answer = answer_engineer_question(req.question, ctx, req.history)
     return {"answer": answer}
 
 
+# ─────────────────────────────────────────────
+# OTHER ROUTES
+# ─────────────────────────────────────────────
 @app.get("/latest")
 def latest():
-    """Fallback polling endpoint — used when SSE connection is down."""
     if not _latest_result:
-        return JSONResponse({"status": "no_result_yet"})
-    return JSONResponse(_latest_result)
+        return {"status": "no_result_yet"}
+    return _latest_result
 
 
 @app.get("/spc")
 def spc_status():
-    """Returns current EWMA SPC status and control limits.
-    Use this in the dashboard SPC widget.
-    """
     return check_spc()
 
 
 @app.get("/health")
 def health():
-    from db_logger import get_claude_usage_today
     return {
-        "status":        "ok",
-        "model":         "sentinel-tflite-int8",
-        "classes":       cfg.NUM_CLASSES,
-        "version":       "1.0.0",
+        "status": "ok",
+        "model": "sentinel-tflite-int8",
+        "classes": cfg.NUM_CLASSES,
+        "version": "1.0.0",
         "claude_budget": get_claude_usage_today(),
-        "sse_clients":   len(_sse_subscribers),
+        "sse_clients": len(_sse_subscribers),
     }
 
-#----fix error-------------------------------------------------
-import os
-import uvicorn
 
+# ─────────────────────────────────────────────
+# LOCAL RUN
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run(
         "api_server_sentinel:app",
         host="0.0.0.0",
